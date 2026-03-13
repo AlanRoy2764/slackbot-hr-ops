@@ -1,0 +1,24 @@
+[Unit]
+Description=Slackbot HR Operations Service
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME_HERE
+WorkingDirectory=/Users/alanroyantony/Documents/Claude Project/Slackbot HR Ops
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/Users/alanroyantony/Documents/Claude Project/Slackbot HR Ops/.env
+ExecStart=/usr/local/bin/python slack_bot.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/Users/alanroyantony/Documents/Claude Project/Slackbot HR Ops/logs/service.log
+StandardError=append:/Users/alanroyantony/Documents/Claude Project/Slackbot HR Ops/logs/service_error.log
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
