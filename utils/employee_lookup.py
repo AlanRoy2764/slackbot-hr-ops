@@ -194,13 +194,7 @@ class EmployeeLookup:
         role = employee.get("job_title", employee.get("designation", "N/A"))
         end_date = employee.get("contract_expiry", employee.get("contract_end", "N/A"))
 
-        return f"""*Employee Details:*
-• **Name:** {name}
-• **Email:** {email}
-• **Company:** {company}
-• **Role:** {role}
-• **Contract End:** {end_date}
-"""
+        return f"*Employee Details:*\n• *Name:* {name}\n• *Email:* {email}\n• *Company:* {company}\n• *Role:* {role}\n• *Contract End:* {end_date}"
 
     def lookup_job_description(self, job_title: str) -> str:
         """

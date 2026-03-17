@@ -208,10 +208,16 @@ class HrLetterSkill(BaseSkill):
             # Success!
             file_url = result.get("file_url", "")
 
+            # Build summary, overriding contract end date for extensions
+            summary_employee = dict(employee)
+            if template_type == "contract_extension" and params.get("new_end_date"):
+                summary_employee["contract_expiry"] = params["new_end_date"]
+                summary_employee["contract_end"] = params["new_end_date"]
+
             return SkillResult(
                 success=True,
                 message=f":white_check_mark: Successfully generated {tmpl['description']} for *{employee.get('employee_name', employee.get('name'))}*!",
-                details=lookup.get_employee_summary(employee),
+                details=lookup.get_employee_summary(summary_employee),
                 attachments=[{
                     "title": tmpl['description'],
                     "url": file_url

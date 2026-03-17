@@ -40,6 +40,41 @@ app = App(
     token=Config.SLACK_BOT_TOKEN,
 )
 
+# ---------------------------------------------------------------------------
+# Bot identity helpers
+# ---------------------------------------------------------------------------
+
+_bot_user_id: str = ""
+
+
+def _get_bot_user_id() -> str:
+    global _bot_user_id
+    if not _bot_user_id:
+        _bot_user_id = app.client.auth_test()["user_id"]
+    return _bot_user_id
+
+
+# ---------------------------------------------------------------------------
+# Reaction helpers
+# ---------------------------------------------------------------------------
+
+def _add_reaction(channel: str, ts: str, emoji: str) -> None:
+    try:
+        app.client.reactions_add(channel=channel, timestamp=ts, name=emoji)
+    except Exception as e:
+        logger.debug(f"Could not add reaction {emoji}: {e}")
+
+
+def _remove_reaction(channel: str, ts: str, emoji: str) -> None:
+    try:
+        app.client.reactions_remove(channel=channel, timestamp=ts, name=emoji)
+    except Exception as e:
+        logger.debug(f"Could not remove reaction {emoji}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Event handlers
+# ---------------------------------------------------------------------------
 
 @app.event("app_mention")
 def handle_app_mention(event: Dict[str, Any], logger: logging.Logger) -> None:
@@ -48,18 +83,23 @@ def handle_app_mention(event: Dict[str, Any], logger: logging.Logger) -> None:
 
     Starts a new thread conversation for each mention.
     """
-    try:
-        channel_id = event["channel"]
-        thread_ts = event["ts"]  # Use message timestamp as thread root
-        user_id = event["user"]
-        text = event.get("text", "")
+    channel_id = event["channel"]
+    event_ts = event["ts"]          # timestamp of the mention itself
+    thread_ts = event["ts"]         # use mention as thread root
+    user_id = event.get("user", "")
+    text = event.get("text", "")
 
+    _add_reaction(channel_id, event_ts, "thinking_face")
+
+    try:
         logger.info(
             f"App mention from user {user_id} in channel {channel_id}: {text[:50]}..."
         )
 
         # Verify HR team access
         if not is_hr_team_member(user_id):
+            _remove_reaction(channel_id, event_ts, "thinking_face")
+            _add_reaction(channel_id, event_ts, "x")
             app.client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
@@ -76,96 +116,86 @@ def handle_app_mention(event: Dict[str, Any], logger: logging.Logger) -> None:
         )
 
         # Remove bot mention from text
-        auth_result = app.client.auth_test()
-        bot_user_id = auth_result["user_id"]
+        bot_user_id = _get_bot_user_id()
         clean_text = text.replace(f"<@{bot_user_id}>", "").strip()
 
         # Handle help command
         if clean_text.lower().strip() in ["help", "hi", "hello"]:
+            _remove_reaction(channel_id, event_ts, "thinking_face")
+            _add_reaction(channel_id, event_ts, "white_check_mark")
             app.client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
                 text=SKILL_DESCRIPTIONS
             )
+            session.add_message("user", clean_text)
             session.add_message("assistant", SKILL_DESCRIPTIONS)
             return
 
+        # Swap to "processing" reaction
+        _remove_reaction(channel_id, event_ts, "thinking_face")
+        _add_reaction(channel_id, event_ts, "gear")
+
         # Use orchestrator to process the request
+        orchestrator = get_orchestrator()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            import asyncio
-            orchestrator = get_orchestrator()
+            result = loop.run_until_complete(orchestrator.process_message(
+                user_message=clean_text,
+                user_id=user_id,
+                channel_id=channel_id,
+                conversation_history=list(session.history),
+                user_context={"user_id": user_id, "channel_id": channel_id},
+                session=session,
+            ))
+        finally:
+            loop.close()
 
-            # Run async orchestrator in sync context
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(orchestrator.process_message(
-                    user_message=clean_text,
-                    user_id=user_id,
-                    channel_id=channel_id,
-                    conversation_history=list(session.history),
-                    user_context={"user_id": user_id, "channel_id": channel_id}
-                ))
-            finally:
-                loop.close()
+        logger.info(f"Orchestrator result: {result}")
 
-            # Debug: Log the result
-            logger.info(f"Orchestrator result type: {type(result)}")
-            logger.info(f"Orchestrator result keys: {result.keys() if isinstance(result, dict) else 'N/A'}")
-            logger.info(f"Orchestrator result: {result}")
+        message_to_send = result.get("message", "")
+        blocks_to_send = result.get("blocks")
 
-            # Extract message from result (try message field first, then blocks)
-            message_to_send = result.get("message", "")
-            logger.info(f"Initial message_to_send: {message_to_send!r}")
+        session.add_message("user", clean_text)
 
-            # If message is empty, try to extract from blocks
-            if not message_to_send and result.get("blocks"):
-                logger.info(f"Extracting from blocks: {result.get('blocks')}")
-                # Extract text from blocks - concatenate all section text
-                message_parts = []
-                for block in result["blocks"]:
-                    if block.get("type") == "section":
-                        text_obj = block.get("text", {})
-                        if isinstance(text_obj, dict) and "text" in text_obj:
-                            message_parts.append(text_obj["text"])
-                        elif isinstance(text_obj, str):
-                            message_parts.append(text_obj)
-                message_to_send = "\n".join(message_parts)
-                logger.info(f"Extracted message: {message_to_send!r}")
-
-            # Send response in thread
-            if message_to_send:
-                logger.info(f"Sending response to Slack (length {len(message_to_send)}): {message_to_send[:100]}...")
-                slack_response = app.client.chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=thread_ts,
-                    text=message_to_send
-                )
-                logger.info(f"Slack API response: {slack_response}")
-                session.add_message("assistant", message_to_send)
-            else:
-                logger.warning(f"No message in result! Result: {result}")
-                # Send fallback
-                app.client.chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=thread_ts,
-                    text="I processed your request but didn't get a response. Please try again."
-                )
-
-            session.add_message("user", clean_text)
-
-        except Exception as e:
-            logger.error(f"Orchestrator error: {e}", exc_info=True)
-            # Fallback response
+        if message_to_send or blocks_to_send:
+            kwargs: Dict[str, Any] = {
+                "channel": channel_id,
+                "thread_ts": thread_ts,
+                "text": message_to_send or "HR Bot response",
+            }
+            if blocks_to_send:
+                kwargs["blocks"] = blocks_to_send
+            app.client.chat_postMessage(**kwargs)
+            session.add_message("assistant", message_to_send)
+            _remove_reaction(channel_id, event_ts, "gear")
+            _add_reaction(channel_id, event_ts, "white_check_mark")
+        else:
+            logger.warning(f"No message in result! Result: {result}")
             app.client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
-                text=f"I'd be happy to help with that! I can generate HR letters and send onboarding emails.\n\nCould you tell me more about what you need? For example:\n• Generate a contract extension for [name]\n• Send onboarding email for [name]"
+                text="I processed your request but couldn't format a response. Please try again."
             )
-            session.add_message("assistant", "Fallback response")
+            _remove_reaction(channel_id, event_ts, "gear")
+            _add_reaction(channel_id, event_ts, "x")
 
     except Exception as e:
         logger.error(f"Error handling app_mention: {e}", exc_info=True)
+        _remove_reaction(channel_id, event_ts, "thinking_face")
+        _remove_reaction(channel_id, event_ts, "gear")
+        _add_reaction(channel_id, event_ts, "x")
+        app.client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=(
+                "I'd be happy to help with that! I can generate HR letters and send onboarding emails.\n\n"
+                "Could you tell me more about what you need? For example:\n"
+                "• Generate a contract extension for [name]\n"
+                "• Send onboarding email for [name]"
+            )
+        )
 
 
 @app.event("message")
@@ -175,16 +205,25 @@ def handle_message(event: Dict[str, Any], logger: logging.Logger) -> None:
 
     Processes replies in bot threads.
     """
+    # Ignore the bot's own messages and system subtypes
+    user_id = event.get("user", "")
+    if user_id == _get_bot_user_id():
+        return
+    if event.get("bot_id"):
+        return
+    if event.get("subtype") in ("bot_message", "message_changed", "message_deleted"):
+        return
+
+    # Only handle messages in threads (replies to bot)
+    thread_ts = event.get("thread_ts")
+    if not thread_ts:
+        return
+
+    channel_id = event["channel"]
+    text = event.get("text", "")
+    event_ts = event["ts"]
+
     try:
-        # Only handle messages in threads (replies to bot)
-        thread_ts = event.get("thread_ts")
-        if not thread_ts:
-            return
-
-        channel_id = event["channel"]
-        user_id = event["user"]
-        text = event.get("text", "")
-
         logger.info(
             f"Thread reply from user {user_id} in thread {thread_ts}: {text[:50]}..."
         )
@@ -194,11 +233,12 @@ def handle_message(event: Dict[str, Any], logger: logging.Logger) -> None:
         session = session_manager.get(thread_ts)
 
         if not session:
-            # Unknown thread - might be a reply to a message we didn't start
+            # Unknown thread — might be a reply to a message we didn't start
             return
 
         # Verify HR team access
         if not is_hr_team_member(user_id):
+            _add_reaction(channel_id, event_ts, "x")
             app.client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
@@ -206,62 +246,61 @@ def handle_message(event: Dict[str, Any], logger: logging.Logger) -> None:
             )
             return
 
+        _add_reaction(channel_id, event_ts, "gear")
+
         # Use orchestrator to process the reply
+        orchestrator = get_orchestrator()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            import asyncio
-            orchestrator = get_orchestrator()
+            result = loop.run_until_complete(orchestrator.process_message(
+                user_message=text,
+                user_id=user_id,
+                channel_id=channel_id,
+                conversation_history=list(session.history),
+                user_context={"user_id": user_id, "channel_id": channel_id},
+                session=session,
+            ))
+        finally:
+            loop.close()
 
-            # Run async orchestrator in sync context
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(orchestrator.process_message(
-                    user_message=text,
-                    user_id=user_id,
-                    channel_id=channel_id,
-                    conversation_history=list(session.history),
-                    user_context={"user_id": user_id, "channel_id": channel_id}
-                ))
-            finally:
-                loop.close()
+        logger.info(f"Thread reply orchestrator result: {result}")
 
-            logger.info(f"Thread reply orchestrator result: {result}")
+        message_to_send = result.get("message", "")
+        blocks_to_send = result.get("blocks")
 
-            # Extract message from result
-            message_to_send = result.get("message", "")
-            if not message_to_send and result.get("blocks"):
-                message_parts = []
-                for block in result["blocks"]:
-                    if block.get("type") == "section":
-                        text_obj = block.get("text", {})
-                        if isinstance(text_obj, dict) and "text" in text_obj:
-                            message_parts.append(text_obj["text"])
-                message_to_send = "\n".join(message_parts)
+        session.add_message("user", text)
 
-            # Send response in thread
-            if message_to_send:
-                logger.info(f"Sending thread reply: {message_to_send[:100]}...")
-                app.client.chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=thread_ts,
-                    text=message_to_send
-                )
-                session.add_message("assistant", message_to_send)
-
-            session.add_message("user", text)
-
-        except Exception as e:
-            logger.error(f"Orchestrator error: {e}")
-            # Fallback response
+        if message_to_send or blocks_to_send:
+            kwargs: Dict[str, Any] = {
+                "channel": channel_id,
+                "thread_ts": thread_ts,
+                "text": message_to_send or "HR Bot response",
+            }
+            if blocks_to_send:
+                kwargs["blocks"] = blocks_to_send
+            app.client.chat_postMessage(**kwargs)
+            session.add_message("assistant", message_to_send)
+            _remove_reaction(channel_id, event_ts, "gear")
+            _add_reaction(channel_id, event_ts, "white_check_mark")
+        else:
             app.client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
-                text=f"I understand. Could you provide more details so I can help you better?"
+                text="I processed your request but couldn't format a response. Please try again."
             )
-            session.add_message("assistant", "Fallback response")
+            _remove_reaction(channel_id, event_ts, "gear")
+            _add_reaction(channel_id, event_ts, "x")
 
     except Exception as e:
         logger.error(f"Error handling message: {e}", exc_info=True)
+        _remove_reaction(channel_id, event_ts, "gear")
+        _add_reaction(channel_id, event_ts, "x")
+        app.client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text="I understand. Could you provide more details so I can help you better?"
+        )
 
 
 def main():

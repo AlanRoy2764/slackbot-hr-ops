@@ -1,267 +1,168 @@
 # Slackbot HR Ops - Development Status
 
-**Last Updated:** 2026-03-13 14:15
+**Last Updated:** 2026-03-17
+**Session closed.** Pick up from the "Next Steps" section below.
 
-## Current Status: 🟡 Partially Working - Bug Fix Untested
+---
 
-The bot successfully receives events and processes them, but there's an issue with response display in Slack.
+## Current Status: 🟢 Core Flow Working
+
+The bot is live in `team-hr-atom` (private channel) on the Mereka & Biji-biji Initiative Team workspace. The full contract extension flow — mention → question → answer → generated letter — works end to end.
+
+---
 
 ## What's Working ✅
 
-### 1. Bot Infrastructure
-- ✅ Slack bot using Socket Mode (no public URL needed)
-- ✅ Event subscriptions configured and working
-- ✅ Bot successfully connects to Slack workspace
-- ✅ Bot receives `@mention` events in channels
-- ✅ Bot receives thread reply events
+### Infrastructure
+- Socket Mode connection, stable and reconnects automatically
+- `app_mention` event handling in both public and private channels
+- `message.groups` event handling for thread replies in private channels
+- HR team access control via `HR_TEAM_USER_IDS`
+- Logging to file (`logs/slackbot.log`) and stdout
+- Emoji reaction status indicators: 🤔 on receipt → ⚙️ processing → ✅ success / ❌ error
+- Bot self-reply guard (won't loop on its own messages)
 
-### 2. Configuration
-- ✅ Environment variable loading via `.env`
-- ✅ Configuration validation on startup
-- ✅ HR team user ID access control
-- ✅ Logging configuration (file + console)
+### Conversational Param Gathering
+- When a skill needs more information, the bot asks questions one at a time in the thread instead of failing
+- Employee is looked up immediately and their details shown for context before any question is asked
+- Session state (`skill_state["pending"]`) persists gathering across thread replies
+- Each reply continues the flow; once all params collected, skill executes automatically
 
-### 3. Orchestrator & Skills
-- ✅ Agent SDK orchestrator routes messages to skills
-- ✅ Claude API integration working (200 OK responses)
-- ✅ Intent detection for skills (hr_letter, onboarding)
-- ✅ Parameter extraction from user messages
-- ✅ Employee lookup from Google Sheets
-- ✅ SkillResult class with Slack block formatting
+### Natural Language Understanding
+- Employee name extracted from free-form messages via Claude haiku (not regex)
+- Date answers parsed with employee's current contract end date as context, so phrases like "1 year after her current contract end date" resolve correctly
+- Career level, contract type answered by number or natural text
+- Free-text params (HOD, salary, role responsibilities) accepted as typed; "skip" leaves blank
 
-### 4. Thread Session Management
-- ✅ Thread-based conversation context
-- ✅ Session manager for concurrent conversations
-- ✅ History tracking per thread
+### HR Letter Skill — `contract_extension`
+- Fully working end to end: finds employee, asks for new end date, generates and uploads DOCX to Drive
+- Success message shows new contract end date (not old one)
+- Employee details block renders correctly with Slack mrkdwn (`*bold*` not `**bold**`)
+- Drive link returned as attachment
 
-## What's Not Working ❌
+### Claude API
+- Main orchestration uses `claude-sonnet-4-6`
+- Name extraction and param parsing use `claude-haiku-4-5-20251001`
+- API calls are logged so you can confirm they're being hit
 
-### 1. Response Display in Slack
-**Status:** Critical Bug
+---
 
-**Symptoms:**
-- Bot processes requests (skill executes, API returns 200 OK)
-- Orchestrator returns valid result with blocks containing text
-- Bot sends fallback message: "I processed your request but didn't get a response. Please try again."
-- No actual response visible in Slack thread
+## What's Untested / Uncertain ⚠️
 
-**Evidence from logs:**
-```
-Orchestrator result: {
-  'message': '',
-  'blocks': [
-    {'type': 'section', 'text': {'type': 'mrkdwn', 'text': "I couldn't find an employee named 'Syahirah That Ends'."}},
-    {'type': 'section', 'text': {'type': 'mrkdwn', 'text': ':warning: *Error:* Employee not found in Active Employees sheet'}}
-  ],
-  'skill_used': 'SkillResult',
-  'success': False
-}
-No message in result!
-```
+| Item | Notes |
+|------|-------|
+| `employment_contract` template | Gathering flow built (asks career_level + contract_type). Not tested live. |
+| `internship_offer` / `traineeship_offer` | Gathering flow built (contract_term, HOD, role_responsibilities). Not tested. |
+| `probation_confirmation` | Gathering flow built (salary, benefits, manager_title). Not tested. |
+| `onboarding` skill | Skill exists, never been tested at all. |
+| Multi-user concurrency | Sessions are per-thread so should be safe, but not stress-tested. |
+| Session timeout behaviour | Stale sessions are cleaned up but the user gets no feedback if they return to an old thread after timeout. |
 
-**Root Cause:**
-The `SkillResult.to_slack_message()` method returns `{"blocks": blocks}` without a `"text"` key. The orchestrator then sets `result["message"] = slack_message.get("text", "")` which returns `""` because "text" key doesn't exist.
+---
 
-The message extraction code in `slack_bot.py` was supposed to handle this, but either:
-1. The extraction logic isn't being reached
-2. The extraction logic has a bug
-3. The Slack API call is failing silently
+## What Didn't Work / Was Fixed This Session
 
-**Fix Attempted:**
-Added enhanced message extraction that concatenates all section texts from blocks. Need to test if this works.
+| Problem | Root Cause | Fix |
+|---------|-----------|-----|
+| Bot responses not appearing in Slack | `to_slack_message()` returned `{"blocks": [...]}` without `"text"` key; orchestrator did `.get("text", "")` → empty string | Added `"text"` key to return value; orchestrator falls back to `skill_result.message` |
+| Blocks sent as plain text extraction (fragile) | `slack_bot.py` tried to manually reconstruct text from block objects | Now passes `blocks=` directly to `chat_postMessage`; `text=` used as notification fallback only |
+| Bot replying to its own thread messages (loop) | `handle_message` had no guard for bot messages; Socket Mode delivers bot messages without `subtype` but with `bot_id` | Added `if event.get("bot_id"): return` guard |
+| Name extraction wrong ("Syahirah That Ends") | Naive regex: split on "for", take first 3 words | Replaced with Claude haiku call: "return only the employee's name" |
+| Date parsing missed employee context | `_parse_param_answer` only knew today's date, not the employee's contract end date | Now passes `employee` dict; contract end date included in haiku prompt |
+| Thread replies not received in private channels | Only `message.channels` was subscribed; private channels need `message.groups` | Added `message.groups` event subscription in Slack App dashboard |
+| `**bold**` rendering as literal asterisks | `get_employee_summary()` used standard markdown `**bold**`; Slack uses `*bold*` | Fixed to use Slack mrkdwn format |
+| Success message showed old contract end date | `get_employee_summary(employee)` used the original employee record | Passes a copy with `contract_expiry` overridden to the new end date |
 
-### 2. Thread Replies
-**Status:** Untested
+---
 
-Bot handler for thread replies exists but hasn't been tested yet.
-
-## Current Project Structure
+## Architecture (Current)
 
 ```
-/Users/alanroyantony/Documents/Claude Project/Slackbot HR Ops/
-├── slack_agent_orchestrator.py   # Agent SDK orchestrator (WORKING)
-├── slack_bot.py                   # Slack bot main entry (PARTIALLY WORKING)
-├── skills/
-│   ├── __init__.py                # Skill registry
-│   ├── base_skill.py              # Base class with SkillResult (NEEDS FIX)
-│   ├── hr_letter_skill.py         # HR letter skill (WORKING)
-│   └── onboarding_skill.py        # Onboarding skill (UNTESTED)
-├── utils/
-│   ├── employee_lookup.py         # Employee data from Sheets (WORKING)
-│   ├── permissions.py             # HR team access control (WORKING)
-│   └── thread_sessions.py         # Thread session manager (WORKING)
-├── config/
-│   ├── settings.py                # Configuration loader (WORKING)
-│   └── prompts.py                 # System prompts (WORKING)
-├── tests/                         # Test suite (PARTIALLY WRITTEN)
-├── logs/
-│   └── slackbot.log               # Log file (EMPTY - logs to stdout only)
-├── .env                           # Environment config (CONFIGURED)
-├── requirements.txt               # Dependencies (INSTALLED)
-├── CLAUDE.md                      # Project docs (NEEDS UPDATE)
-├── README.md                      # Setup guide (NEEDS UPDATE)
-└── STATUS.md                      # This file
+@mention / thread reply
+        │
+        ▼
+  slack_bot.py
+  ├── emoji reaction: 🤔
+  ├── access control check
+  ├── session get/create
+  └── orchestrator.process_message(session=session)
+              │
+              ├─ [pending state?] → _continue_gathering()
+              │       ├── parse answer (Claude haiku, with employee context)
+              │       ├── [more params?] → ask next question
+              │       └── [done] → _execute_skill()
+              │
+              └─ [no pending] → _try_invoke_skill()
+                      ├── detect intent (keyword match)
+                      ├── extract name (Claude haiku)
+                      ├── look up employee (Google Sheets)
+                      ├── determine missing params
+                      ├── [missing] → store pending, show question
+                      └── [complete] → _execute_skill()
+                                            │
+                                        hr_letter_skill.execute()
+                                            ├── build_values_for_template()
+                                            ├── render_letter() → DOCX
+                                            └── upload to Google Drive → URL
 ```
 
-## Known Issues & Bugs
+---
 
-1. **[CRITICAL]** Response not displayed in Slack
-   - File: `slack_bot.py` lines 115-147
-   - File: `skills/base_skill.py` lines 31-92
-   - Fix attempted: Enhanced message extraction in slack_bot.py
+## Slack App Configuration (Current)
 
-2. **[MINOR]** Logs not written to file
-   - File: `slack_bot.py` line 31
-   - Config.LOG_FILE points to `logs/slackbot.log` but file stays empty
-   - Logs appear in stdout/stderr only
-
-3. **[MINOR]** hr_automation symlink not created
-   - Intended to link to `~/Documents/Claude Project/Google Workspace Automation/hr-automation`
-   - Currently using sys.path manipulation instead
-
-## Next Steps
-
-### Immediate (To Fix Critical Bug)
-
-1. **Fix response display**
-   - [ ] Test the enhanced message extraction code
-   - [ ] If still failing, debug the `chat_postMessage` API call
-   - [ ] Consider using blocks directly in Slack API instead of extracting text
-   - [ ] Add explicit error handling for Slack API failures
-
-2. **Verify thread replies work**
-   - [ ] Test conversation continuation in threads
-   - [ ] Verify session context is maintained
-
-### Short Term
-
-3. **Test onboarding skill**
-   - [ ] Verify email sending works
-   - [ ] Test with real employee data
-
-4. **Improve error messages**
-   - [ ] Better feedback when employee not found
-   - [ ] Clear instructions for correcting errors
-
-5. **Logging fixes**
-   - [ ] Fix file handler so logs write to file
-   - [ ] Add rotation for log files
-
-### Long Term
-
-6. **Additional skills**
-   - [ ] Leave balance inquiry
-   - [ ] Holiday request submission
-   - [ ] Employee directory search
-   - [ ] Document generation preview
-
-7. **Production deployment**
-   - [ ] Systemd service for auto-restart
-   - [ ] Health check endpoint
-   - [ ] Monitoring/alerting setup
-
-8. **Testing**
-   - [ ] Complete test coverage for all modules
-   - [ ] Integration tests with Slack API mocks
-   - [ ] End-to-end tests with test workspace
-
-## Lessons Learned
-
-### Technical
-
-1. **Slack Bolt Socket Mode**
-   - Doesn't require `signing_secret` in App initialization (only for HTTP mode)
-   - Event handlers are synchronous by default, not async
-   - Use `thread_ts` for all thread responses
-
-2. **Agent SDK**
-   - No `claude-agent-sdk` PyPI package exists
-   - Use `anthropic` SDK directly
-   - Model name: `claude-sonnet-4-20250514` or `claude-3-5-sonnet-20241022`
-
-3. **Async/Sync Integration**
-   - Creating new event loop each request is inefficient but works
-   - Better approach might be a single loop with `run_coroutine_threadsafe`
-
-4. **Slack API Message Format**
-   - `chat.postMessage` with `text` parameter works for simple messages
-   - `blocks` parameter for rich formatting
-   - Need to provide `text` as fallback even when using `blocks`
-
-### Process
-
-1. **Start with working implementation, not ideal architecture**
-   - The symlink to hr_automation never happened
-   - sys.path manipulation works but is fragile
-
-2. **Test incrementally**
-   - Should have tested "help" command first (simple, no skill invocation)
-   - Then tested hr_letter with known good employee
-   - Then tested error cases
-
-3. **Debug logging is essential**
-   - The enhanced debug output added at the end would have saved time
-   - Should have had detailed logging from the start
-
-4. **Slack App configuration is tricky**
-   - Event Subscriptions must be enabled
-   - Bot must be reinstalled after scope changes
-   - Token changes require app reinstall
-
-## Environment Configuration
-
-Required `.env` variables (example):
-```bash
-# Anthropic Claude API
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Slack Bot (Socket Mode)
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_APP_LEVEL_TOKEN=xapp-...
-SLACK_SIGNING_SECRET=...  # Not used in Socket Mode but kept for compatibility
-
-# HR Team Access
-HR_TEAM_USER_IDS=U08483FRUQ4,U123456,U123457
-
-# Google Workspace
-CONTRACTS_FOLDER_ID=...
-GMAIL_SENDER=hr@yourcompany.com
-EMPLOYEE_SHEET_ID=1VbRZ4q1VMxrwnDJGwVN9w1sUOBBWHmBf9yXRT0OAY4g
-
-# Logging
-LOG_LEVEL=INFO
-LOG_FILE=logs/slackbot.log
-```
-
-## Slack App Configuration
-
-**Required Scopes:**
-- `app_mentions:read` - Detect @bot mentions
-- `chat:write` - Post messages in threads
-- `channels:history` - Read thread replies
-- `groups:history` - Read private channel messages
+**OAuth Scopes:**
+- `app_mentions:read`
+- `chat:write`
+- `channels:history`
+- `groups:history`
+- `reactions:write`
 
 **Event Subscriptions:**
-- `app_mention` - User tags @bot
-- `message.channels` - Messages in public channels
+- `app_mention`
+- `message.channels`
+- `message.groups` ← added this session
 
-**Bot Permissions:**
-- Bot must be invited to the channel
-- Bot user ID: U0AL8GPUJ2Z
+**Bot user ID:** `U0AL8GPUJ2Z`
+**Workspace:** Mereka & Biji-biji Initiative Team
 
-## How to Resume Development
+> After any scope or event change, the app must be reinstalled to the workspace.
 
-1. **Read this file** to understand current state
-2. **Check bot status:**
-   ```bash
-   ps aux | grep slack_bot.py
-   ```
-3. **View logs:**
-   ```bash
-   tail -f /private/tmp/claude-501/-Users-alanroyantony-Documents-Claude-Project-Slackbot-HR-Ops/*/tasks/*.output
-   ```
-4. **Test the bug fix:**
-   - Mention bot: `@hr-bot help`
-   - Check if response appears in Slack
-5. **If still broken**, add more debug logging to trace the exact failure point
-6. **Consider alternative approach:** Use Slack blocks directly in `chat.postMessage` instead of extracting text
+---
+
+## Next Steps (When Resuming)
+
+### High Priority
+- [ ] **Test `employment_contract` end to end** — career level + contract type gathering, then full letter generation
+- [ ] **Test `internship_offer` and `traineeship_offer`** — includes HOD and role responsibilities
+- [ ] **Test `probation_confirmation`** — salary, benefits, manager title
+- [ ] **Test `onboarding` skill** — never been run; likely needs debugging
+
+### Medium Priority
+- [ ] **Session expiry UX** — if a user returns to an old thread after session timeout, they get a confusing "unknown thread" silence. Should post a message: "This conversation has expired. Start a new one with @HR Oppie Bot."
+- [ ] **Cancel/restart flow** — allow a user to say "cancel" or "start over" during param gathering
+- [ ] **Email field fix** — employee email is showing as N/A; check which column name the sheet uses
+
+### Low Priority / Future
+- [ ] Production deployment via `launchd` (macOS) or `systemd` (Linux) for auto-restart
+- [ ] Add skills: leave balance inquiry, employee directory search
+- [ ] Replace `sys.path` manipulation in `hr_letter_skill.py` with a proper package install of `hr-automation`
+- [ ] Monitoring: alert if bot goes offline
+
+---
+
+## How to Resume
+
+```bash
+cd "/Users/alanroyantony/Documents/Claude Project/Slackbot HR Ops"
+
+# Check if bot is running
+ps aux | grep slack_bot.py | grep -v grep
+
+# Start bot
+source venv/bin/activate && python slack_bot.py
+
+# Watch logs
+tail -f /tmp/slackbot.log
+```
+
+Read `CLAUDE.md` for full architecture and file reference before making changes.

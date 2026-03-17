@@ -89,7 +89,7 @@ class SkillResult:
                 }
             })
 
-        return {"blocks": blocks} if blocks else {"text": self.message}
+        return {"text": self.message, "blocks": blocks} if blocks else {"text": self.message}
 
 
 class BaseSkill(ABC):
